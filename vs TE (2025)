@@ -1,0 +1,165 @@
+
+"""
+TE-style computation toolkit for U[0,1] case + our alpha-frontier calculator.
+
+What this module provides:
+  1) Functions to compute TE-style EGT for any given monotone partitions on [0,1],
+     with a deterministic trade rule y_{ij} in {0,1}. A helper builds the classic
+     upper-triangular rule y_{ij} = 1{i > j}.
+  2) Helpers to build uniform partitions from cutpoints and derive signal means
+     m_i, n_j and probabilities wB_i, wS_j automatically.
+  3) Buyer/Seller payoffs under the equal-split pricing benchmark
+     (p_{ij} = (m_i + n_j)/2 whenever y_{ij}=1). This pins down payoffs uniquely
+     for a given (m, n, w, y).
+  4) Our paper’s alpha-frontier closed-form payoffs for the uniform case, and a solver
+     to hit a target buyer payoff and report the implied seller payoff / feasibility.
+
+Author: JaeminSon
+"""
+
+import numpy as np
+from dataclasses import dataclass
+from typing import List, Tuple, Optional
+
+# ---------- Core helpers for uniform partitions ----------
+def partition_from_cutpoints(cuts: List[float]) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Given cutpoints 0 = t0 < t1 < ... < tk = 1, return:
+      - widths w_i = t_i - t_{i-1}
+      - means  m_i = (t_{i-1} + t_i)/2   (uniform on each bin)
+    """
+    cuts = np.array(cuts, dtype=float)
+    if not (np.isclose(cuts[0], 0.0) and np.isclose(cuts[-1], 1.0)):
+        raise ValueError("cuts must start at 0 and end at 1")
+    if not np.all(np.diff(cuts) > 1e-12):
+        raise ValueError("cutpoints must be strictly increasing")
+    widths = np.diff(cuts)
+    means  = (cuts[:-1] + cuts[1:]) / 2.0
+    return widths, means
+
+def upper_triangular_trade(nB: int, nS: int) -> np.ndarray:
+    """
+    Build y_{ij} = 1 if i > j else 0, with i in {1..nB}, j in {1..nS}.
+    (Note: indices are 0-based inside the array.)
+    """
+    y = np.zeros((nB, nS), dtype=int)
+    for i in range(nB):
+        for j in range(nS):
+            if i > j:
+                y[i, j] = 1
+    return y
+
+# ---------- EGT + equal-split payoffs ----------
+from dataclasses import dataclass
+
+@dataclass
+class TEOutcome:
+    EGT: float
+    U_B: float
+    U_S: float
+    y: np.ndarray
+
+def compute_te_outcome(
+    wB: np.ndarray,
+    mB: np.ndarray,
+    wS: np.ndarray,
+    mS: np.ndarray,
+    y: np.ndarray,
+    split: str = "equal",
+) -> TEOutcome:
+    """
+    Compute TE objective (EGT) and buyer/seller payoffs under a specified split rule.
+    Currently supported:
+      - split="equal": p_{ij} = (m_i + n_j)/2 on active cells -> Buyer = Seller = 0.5*EGT
+    """
+    wB = np.asarray(wB, dtype=float)
+    wS = np.asarray(wS, dtype=float)
+    mB = np.asarray(mB, dtype=float)
+    mS = np.asarray(mS, dtype=float)
+    if y.shape != (len(mB), len(mS)):
+        raise ValueError("shape mismatch for y vs. (mB, mS)")
+
+    # EGT
+    EGT = 0.0
+    for i in range(len(mB)):
+        for j in range(len(mS)):
+            if y[i, j] == 1:
+                EGT += wB[i] * wS[j] * (mB[i] - mS[j])
+
+    if split == "equal":
+        U_B = 0.5 * EGT
+        U_S = 0.5 * EGT
+    else:
+        raise NotImplementedError("Only equal-split supported in this version.")
+
+    return TEOutcome(EGT=EGT, U_B=U_B, U_S=U_S, y=y)
+
+# ---------- Our alpha-frontier (uniform) closed forms ----------
+def payoffs_uniform_theta(theta: float):
+    """
+    Given theta in [1,2], compute (Pi_B, Pi_S, W) for our threshold algorithm on U[0,1]:
+      Pi_B(theta) = (theta - 1) / (3 theta^2)
+      Pi_S(theta) = 1 / (6 theta^2)
+      W(theta)    = (2 theta - 1) / (6 theta^2)
+    """
+    t = float(theta)
+    if (t < 1.0) or (t > 2.0):
+        raise ValueError("theta must be in [1,2]")
+    Pi_B = (t - 1.0) / (3.0 * t * t)
+    Pi_S = 1.0 / (6.0 * t * t)
+    W    = (2.0 * t - 1.0) / (6.0 * t * t)
+    return Pi_B, Pi_S, W
+
+def solve_theta_for_target_buyer(target_B: float, tol: float = 1e-12) -> Optional[float]:
+    """
+    Solve for theta in [1,2] such that Pi_B(theta) = target_B.
+    Returns theta or None if target_B is outside feasible range [0, 1/12].
+    """
+    # Buyer payoff range on frontier: Pi_B(1)=0, Pi_B(2)=1/12 ≈ 0.083333...
+    if (target_B < -1e-15) or (target_B > (1.0/12.0 + 1e-15)):
+        return None
+    # monotone in theta, use bisection
+    lo, hi = 1.0, 2.0
+    for _ in range(100):
+        mid = 0.5 * (lo + hi)
+        Pi_B_mid = (mid - 1.0) / (3.0 * mid * mid)
+        if Pi_B_mid < target_B:
+            lo = mid
+        else:
+            hi = mid
+        if abs(Pi_B_mid - target_B) < tol:
+            return mid
+    return 0.5 * (lo + hi)
+
+def alpha_from_theta(theta: float) -> float:
+    """ alpha = 1 / (3 - theta), for theta in [1,2] -> alpha in [1/2, 1] """
+    return 1.0 / (3.0 - float(theta))
+
+def theta_from_alpha(alpha: float) -> float:
+    """ theta = 3 - 1/alpha """
+    return 3.0 - 1.0/float(alpha)
+
+# ---------- Quick demo when run as script ----------
+if __name__ == "__main__":
+    # TE n=2 partitions
+    wB2, mB2 = partition_from_cutpoints([0.0, 1/3, 1.0])
+    wS2, mS2 = partition_from_cutpoints([0.0, 2/3, 1.0])
+    y2 = np.array([[0,0],[1,0]], dtype=int)
+    out2 = compute_te_outcome(wB2, mB2, wS2, mS2, y2, split="equal")
+    print("TE n=2 (equal-split):", out2)
+
+    # TE n=3 partitions
+    wB3, mB3 = partition_from_cutpoints([0.0, 0.2, 0.6, 1.0])  # means [0.1, 0.4, 0.8]
+    wS3, mS3 = partition_from_cutpoints([0.0, 0.4, 0.8, 1.0])  # means [0.2, 0.6, 0.9]
+    y3 = np.zeros((3,3), dtype=int)
+    for i in range(3):
+        for j in range(3):
+            if i > j:
+                y3[i, j] = 1
+    out3 = compute_te_outcome(wB3, mB3, wS3, mS3, y3, split="equal")
+    print("TE n=3 (equal-split):", out3)
+
+    # Our frontier: equal-split point (theta=1.5)
+    t_eq = 1.5
+    PiB_eq, PiS_eq, W_eq = payoffs_uniform_theta(t_eq)
+    print("Our frontier equal-split theta=1.5:", (PiB_eq, PiS_eq, W_eq))
